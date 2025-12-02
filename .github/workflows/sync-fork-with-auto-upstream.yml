@@ -87,13 +87,106 @@ jobs:
         env:
           SOURCE_REPO: ${{ steps.repo_info.outputs.upstream_full_name }}
           TARGET_REPO: ${{ steps.repo_info.outputs.target_repo }}
-          GITHUB_TOKEN: ${{ secrets.MY_GIT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.MY_GIT_TOKEN }}  # 或者使用 secrets.GITHUB_TOKEN（但权限可能不足）
         run: |
-          echo "同步源仓库: $SOURCE_REPO"
-          echo "同步目标仓库（你的 Fork）: $TARGET_REPO"
+          echo "🔁 开始同步 Releases 和附件"
+          echo "📥 源仓库（上游）: $SOURCE_REPO"
+          echo "📤 目标仓库（你的 Fork）: $TARGET_REPO"
 
-          # [其余部分保持不变，即之前提供的 Releases + 附件同步逻辑]
-          # （为简洁，此处省略，你可以复用之前提供的完整同步逻辑，把其中的硬编码 SOURCE_REPO 替换为 $SOURCE_REPO，同理 TARGET_REPO）
-          #
-          # 如果你希望我在这里也提供完整的 Releases + 附件同步代码（带上自动获取的 $SOURCE_REPO 和 $TARGET_REPO），请告诉我！
-          # 或者你可以直接把之前那段 “同步 Releases + 附件” 的代码（使用 $SOURCE_REPO 和 $TARGET_REPO 变量）拷贝到这个步骤里。
+          # 获取源仓库的所有 Releases
+          RELEASES=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            https://api.github.com/repos/$SOURCE_REPO/releases)
+
+          # 检查是否成功获取 Releases 列表
+          echo "$RELEASES" | jq -e 'type == "array"' >/dev/null 2>&1
+          if [ $? -ne 0 ]; then
+            echo "❌ 获取 Releases 失败，返回内容可能不是有效的数组或 API 出错。"
+            echo "返回的原始内容："
+            echo "$RELEASES"
+            exit 1
+          fi
+
+          # 遍历每一个 Release
+          echo "$RELEASES" | jq -c '.[]' | while read -r release; do
+            TAG_NAME=$(echo "$release" | jq -r '.tag_name')
+            NAME=$(echo "$release" | jq -r '.name')
+            BODY=$(echo "$release" | jq -r '.body')
+            DRAFT=$(echo "$release" | jq -r '.draft')
+            PRERELEASE=$(echo "$release" | jq -r '.prerelease')
+            RELEASE_ID_ORIGINAL=$(echo "$release" | jq -r '.id')
+
+            echo "🔁 正在处理 Release: $NAME (Tag: $TAG_NAME)"
+
+            # Step 1: 在你的 Fork 中创建相同的 Release
+            echo "🆕 在你的 Fork 中创建 Release: $NAME"
+            CREATED_RELEASE=$(curl -X POST \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/$TARGET_REPO/releases \
+              -d '{
+                "tag_name": "'"$TAG_NAME"'",
+                "name": "'"$NAME"'",
+                "body": "'"$BODY"'",
+                "draft": '$DRAFT',
+                "prerelease": '$PRERELEASE'
+              }')
+
+            # 检查是否创建成功
+            echo "$CREATED_RELEASE" | jq -e 'has("id")' >/dev/null 2>&1
+            if [ $? -ne 0 ]; then
+              echo "❌ 创建 Release 失败，返回内容："
+              echo "$CREATED_RELEASE"
+              echo "⏩ 跳过此 Release 的附件同步"
+              continue
+            fi
+
+            # 获取创建的 Release 的 upload_url 和 id
+            UPLOAD_URL=$(echo "$CREATED_RELEASE" | jq -r '.upload_url' | sed 's/{?name,label}//')
+            RELEASE_ID=$(echo "$CREATED_RELEASE" | jq -r '.id')
+
+            echo "✅ 创建成功！Release ID: $RELEASE_ID"
+            echo "📤 Upload URL Base: $UPLOAD_URL"
+
+            # Step 2: 获取该 Release 的所有附件（Assets）
+            ASSETS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+              https://api.github.com/repos/$SOURCE_REPO/releases/$RELEASE_ID_ORIGINAL/assets)
+
+            echo "$ASSETS" | jq -c '.[]' | while read -r asset; do
+              ASSET_NAME=$(echo "$asset" | jq -r '.name')
+              ASSET_URL=$(echo "$asset" | jq -r '.url')
+              ASSET_ID=$(echo "$asset" | jq -r '.id')
+              CONTENT_TYPE=$(echo "$asset" | jq -r '.content_type')
+              DOWNLOAD_URL=$(echo "$asset" | jq -r '.browser_download_url')
+
+              echo "⬇️  正在下载附件: $ASSET_NAME"
+
+              # 下载附件到临时目录
+              curl -s -L -H "Authorization: token $GITHUB_TOKEN" \
+                -H "Accept: application/octet-stream" \
+                "$DOWNLOAD_URL" -o "/tmp/$ASSET_NAME"
+
+              # 上传附件到你的 Fork 的 Release
+              echo "📤 正在上传附件: $ASSET_NAME 到 Release ID $RELEASE_ID"
+              UPLOAD_RESPONSE=$(curl -X POST \
+                -H "Authorization: token $GITHUB_TOKEN" \
+                -H "Content-Type: $CONTENT_TYPE" \
+                --data-binary @"/tmp/$ASSET_NAME" \
+                "${UPLOAD_URL}?name=${ASSET_NAME}" 2>&1)
+
+              if echo "$UPLOAD_RESPONSE" | grep -q "201 Created"; then
+                echo "✅ 附件上传成功: $ASSET_NAME"
+              else
+                echo "❌ 附件上传失败: $ASSET_NAME"
+                echo "错误详情："
+                echo "$UPLOAD_RESPONSE"
+              fi
+
+              # 清理临时文件
+              rm -f "/tmp/$ASSET_NAME"
+
+              echo "--------------------------------------------------"
+            done
+
+          done
+
+          echo "🎉 所有 Releases 和附件同步完成！"
